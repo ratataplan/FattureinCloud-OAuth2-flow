@@ -1,0 +1,7 @@
+int codiceAzienda = 1;
+
+FattureinCloudOauth2 fattureinCloudOauth2 = new FattureinCloudOauth2(codiceAzienda);
+
+int company_id = fattureinCloudOauth2.getCompanyID();
+
+MessageBox.Show("companyId:\n" + company_id.ToString(), "Informazioni", MessageBoxButtons.OK, MessageBoxIcon.Information);
