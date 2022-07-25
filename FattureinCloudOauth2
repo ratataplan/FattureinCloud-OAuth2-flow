@@ -1,0 +1,537 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+using It.FattureInCloud.Sdk.OauthHelper;
+using It.FattureInCloud.Sdk.Api;
+using It.FattureInCloud.Sdk.Client;
+using It.FattureInCloud.Sdk.Model;
+using System.IO;
+using System.Diagnostics;
+using Newtonsoft.Json;
+using System.Windows.Forms;
+using System.Windows.Automation;//UIAutomationClient.dll UIAutomationTypes.dll Aggiungi riferimenti
+using FattureinCloud;
+using System.Data;
+using System.Data.SqlClient;
+
+namespace EducationService
+{
+    /// <summary>
+    /// Questa classe permette di eseguire Oauth2 da un'applicazione Desktop Windows in modo molto lineare
+    /// Apre una Tab di Chrome ed attende il redirect in caso di token nullo. Cattura il token dai parametri dell'url
+    /// </summary>
+    public class FattureinCloudOauth2
+    {
+        OAuth2AuthorizationCodeManager oauth;
+        Process chromeprocess;
+
+        private int _companyID = 0;
+        //string subPath = @"C:\code";
+        private string _client_id = String.Empty;
+        private string _client_secret = String.Empty;
+        private string _token = String.Empty;
+        private DateTime _token_created = new DateTime(2021, 1, 1);
+        private string _redirectUri = String.Empty;
+        private string _basePath = @"https://api-v2.fattureincloud.it";
+        Dictionary<string, object> dic_secrets;
+        private int _codice_azienda = 0;
+
+
+        /// <summary>
+        /// Costruttore della classe - legge i dati dal DB e li inserisce nei campi privati dell'istanza
+        /// </summary>
+        /// <param name="codiceAzienda"></param>
+        public FattureinCloudOauth2(int codiceAzienda)
+        {
+            this._codice_azienda = codiceAzienda;
+
+            dic_secrets = Azienda.getClientidClientSecret(_codice_azienda);
+
+            _client_id = Convert.ToString(dic_secrets["client_id"]);
+            _client_secret = Convert.ToString(dic_secrets["client_secret"]);
+
+            if (dic_secrets["redirectUri"] != DBNull.Value)
+            {
+                _redirectUri = Convert.ToString(dic_secrets["redirectUri"]);
+            }
+
+            if (dic_secrets["companyID"] != DBNull.Value)
+            {
+                _companyID = Convert.ToInt32(dic_secrets["companyID"]);
+            }
+
+            if (dic_secrets["token"] != DBNull.Value)
+            {
+                _token = Convert.ToString(dic_secrets["token"]);
+            }
+            if (dic_secrets["token_created"] != DBNull.Value)
+            {
+                _token_created = Convert.ToDateTime(dic_secrets["token_created"]);
+            }
+        }
+
+
+
+        /// <summary>
+        /// Legge il token
+        /// </summary>
+        /// <returns></returns>
+        public string readToken()
+        {
+            string accessToken = String.Empty;
+            //string tokenpath = subPath + @"\token.json";
+            //StreamReader file;
+
+            if(String.IsNullOrEmpty(_token))
+            //if (!File.Exists(tokenpath))
+            {
+                string message = "Devi autenticarti token non esistente";
+                string caption = "Informazioni";
+                MessageBoxButtons buttons = MessageBoxButtons.OK;
+                MessageBoxIcon icons = MessageBoxIcon.Information;
+
+                TopMostMessageBox.Show(message, caption, buttons, icons);
+
+                // se il token non esiste chiede l'autenticazione
+                this.Autenticate();
+            }
+            else
+            {
+                //string path = subPath + @"\token.json";
+
+                //file = new StreamReader(path);
+                //DateTime dt_token = File.GetLastWriteTime(path);
+                //file.Close();
+
+                DateTime now = DateTime.UtcNow;
+                //TimeSpan difference = now.Subtract(dt_token);
+                TimeSpan difference = now.Subtract(_token_created);
+
+                //se sono trascorse più di 24 ore dal rilascio del token
+                if (difference.TotalSeconds > 86400)// 24 ore
+                {
+                    // se è trascorso più di un anno dall'ultima autenticazione
+                    if (difference.TotalSeconds > (86400 * 365))
+                    {// +1 anno
+
+                        string message = "Devi autenticarti, è passato più di un anno\ndall'ultima autenticazione.";
+                        string caption = "Informazioni";
+                        MessageBoxButtons buttons = MessageBoxButtons.OK;
+                        MessageBoxIcon icons = MessageBoxIcon.Information;
+
+                        TopMostMessageBox.Show(message, caption, buttons, icons);
+
+                        //chiede l'autenticazione
+                        this.Autenticate();
+
+                    }
+                    else
+                    {
+                        string message = "Refreshing the token";
+                        string caption = "Informazioni";
+                        MessageBoxButtons buttons = MessageBoxButtons.OK;
+                        MessageBoxIcon icons = MessageBoxIcon.Information;
+
+                        //TopMostMessageBox.Show(message, caption, buttons, icons);
+                        //txt_redirect.Text = "Refreshing the token";
+
+                        //esegue il refresh del token
+                        accessToken = this.refreshToken();
+                    }
+
+                }
+                else
+                {
+                    //retrieve the oAuth access token in the file token.json
+                    //file = new StreamReader(path);
+                    //var line = file.ReadLine();
+                    //file.Close();
+                    //dynamic json = JsonConvert.DeserializeObject<dynamic>(line);
+                    dynamic json = JsonConvert.DeserializeObject<dynamic>(_token);
+                    //ottiene l'accessToken
+                    accessToken = json.access_token;
+                }
+            }
+
+            return accessToken;
+        }
+
+
+
+        /// <summary>
+        /// Apre la finestra di autenticazione in Chrome
+        /// </summary>
+        public void Autenticate()
+        {
+            oauth = new OAuth2AuthorizationCodeManager(_client_id, _client_secret, _redirectUri);
+
+            // the oauth object is defined at the step 1
+
+            var scopes = new List<Scope> {
+                Scope.SETTINGS_ALL,
+                Scope.ENTITY_SUPPLIERS_ALL,
+                Scope.ENTITY_CLIENTS_ALL,
+                Scope.ISSUED_DOCUMENTS_INVOICES_ALL,
+                Scope.RECEIVED_DOCUMENTS_READ//Acquisti
+            };
+
+            var url = oauth.GetAuthorizationUrl(scopes, "EDUCATION_STATE");
+
+            //aprire finestra del browser e leggere
+
+            try
+            {
+                ProcessStartInfo startInfo = new ProcessStartInfo();
+                startInfo.UseShellExecute = true;
+                startInfo.FileName = "chrome.exe";
+                startInfo.Arguments = url;// + " --new-window";
+                //startInfo.WindowStyle = ProcessWindowStyle.Minimized;
+
+                //apre una Tab di Chrome con l'url fornita per l'autenticazione
+                chromeprocess = System.Diagnostics.Process.Start(startInfo);
+            }
+            catch (System.ComponentModel.Win32Exception noBrowser)
+            {
+                if (noBrowser.ErrorCode == -2147467259)
+                    MessageBox.Show(noBrowser.Message);
+            }
+            catch (System.Exception other)
+            {
+                MessageBox.Show(other.Message);
+            }
+        }
+
+
+
+
+        /// <summary>
+        /// Esegue il refresh del token
+        /// </summary>
+        /// <returns>newaccessToken</returns>
+        public string  refreshToken()
+        {
+            //https://github.com/fattureincloud/api/discussions
+
+            //string path = subPath + @"\token.json";
+
+
+            //if (File.Exists(path))
+            //{
+            string message = "Refresh token";
+            string caption = "Informazioni";
+            MessageBoxButtons buttons = MessageBoxButtons.OK;
+            MessageBoxIcon icons = MessageBoxIcon.Information;
+
+            //TopMostMessageBox.Show(message, caption, buttons, icons);
+
+            //txt_redirect.Text += "\n" + "Refresh token";
+
+            //StreamReader file = new StreamReader(path);
+            //var line = file.ReadLine();
+            //file.Close();
+
+            dynamic json = JsonConvert.DeserializeObject<dynamic>(_token);
+            var refreshToken = json.refresh_token;
+
+            //txt_redirect.Text += "\n" + refreshToken;
+
+            if (oauth is null)//non eseguito Autenticate()
+            {
+                //string code = HttpContext.Request.Query["code"];
+                oauth = new OAuth2AuthorizationCodeManager(_client_id, _client_secret, _redirectUri);
+
+            }
+
+            // ottiene il nuovo token dal refreshToken che ha validità di un anno
+            var tokenObj = oauth.RefreshToken(Convert.ToString(refreshToken));
+
+            // ottiene l'accessToken
+            var newaccessToken = tokenObj.AccessToken;
+            //var newrefreshToken = tokenObj.RefreshToken;
+
+            //txt_redirect.Text += "\n" + JsonConvert.SerializeObject(tokenObj);
+
+            // salva il token nel DB
+            this.saveToken(tokenObj);
+
+            //restituisce l'accessToken
+            return newaccessToken;
+
+            //}
+        }
+
+
+
+        /// <summary>
+        /// Salva il token nel DB
+        /// </summary>
+        /// <param name="tokenObj"></param>
+        public void saveToken(OAuth2AuthorizationCodeTokenResponse tokenObj)
+        {
+            //se non esiste la directory code devo crearla
+
+            //System.IO.Directory.CreateDirectory(subPath);
+
+            //StreamWriter file = new StreamWriter(subPath + @"\token.json");
+            //file.Write(JsonConvert.SerializeObject(tokenObj)); //saving the oAuth access token in the file token.json in the bin folder
+            //file.Close();
+
+            //Debug.WriteLine("Token saved succesfully in token.json in your folder");
+
+
+
+            string tabella = "[Accounting].[tblAziende]";
+
+            StringBuilder sb = new StringBuilder(1000);
+
+            sb.Append(" UPDATE " + tabella);
+            sb.Append(" SET token = @token,");
+            sb.Append(" token_created = @token_created");
+            sb.Append(" WHERE id = @id");
+
+            List<SqlParameter> pList = new List<SqlParameter>();
+
+            SqlParameter p = new SqlParameter();
+            p.ParameterName = "@token";
+            p.SqlDbType = SqlDbType.VarChar;
+            p.Direction = ParameterDirection.Input;
+            p.Value = JsonConvert.SerializeObject(tokenObj);
+            pList.Add(p);
+
+
+            p = new SqlParameter();
+            p.ParameterName = "@token_created";
+            p.SqlDbType = SqlDbType.DateTime;
+            p.Direction = ParameterDirection.Input;
+            p.Value = DateTime.Now;
+            pList.Add(p);
+
+            p = new SqlParameter();
+            p.ParameterName = "@id";
+            p.SqlDbType = SqlDbType.Int;
+            p.Direction = ParameterDirection.Input;
+            p.Value = _codice_azienda;
+            pList.Add(p);
+
+            string strSQLcnn = SQL.connectSQLStringBuild(true);
+
+            SQL.executeSQL(strSQLcnn, sb.ToString(), pList);
+        }
+
+
+
+        /// <summary>
+        /// Legge il token dalla Tab di Chrome con i parametri con urlRedirect e lo salva nel DB
+        /// </summary>
+        /// <returns></returns>
+        public string getSaveTokenWithParams()
+        {
+            string accessToken = String.Empty;
+
+            if (oauth is null)//già eseguito Autenticate()
+            {
+                string message = "Autenticazione nulla, devi autenticarti.";
+                string caption = "Informazioni";
+                MessageBoxButtons buttons = MessageBoxButtons.OK;
+                MessageBoxIcon icons = MessageBoxIcon.Information;
+
+                TopMostMessageBox.Show(message, caption, buttons, icons);
+
+                //txt_redirect.Text = "Autenticazione nulla, devi autenticarti.\nFai nuovamente click su Get token";
+
+                this.Autenticate();
+            }
+            else
+            {
+                //get from browser
+
+                //https://developers.fattureincloud.it/docs/authentication/code-flow/sdk-oauth-helper
+
+                if (chromeprocess is null)
+                {
+                    string message = "Autenticazione già eseguita";
+                    string caption = "Informazioni";
+                    MessageBoxButtons buttons = MessageBoxButtons.OK;
+                    MessageBoxIcon icons = MessageBoxIcon.Information;
+
+                    TopMostMessageBox.Show(message, caption, buttons, icons);
+                }
+                else
+                {
+                    var myparams = oauth.GetParamsFromUrl(this.GetActiveTabUrl());
+
+                    var code = myparams.AuthorizationCode;
+                    var state = myparams.State;
+
+                    //Debug.WriteLine("code " + code);
+                    //Debug.WriteLine("state " + state);
+
+                    if (state == "EDUCATION_STATE")
+                    {
+                        //RestSharp 106.13.0
+                        var tokenObj = oauth.FetchToken(code);
+
+                        //################################
+                        this.saveToken(tokenObj);
+                        //################################
+
+                        accessToken = tokenObj.AccessToken;
+                        //var refreshToken = tokenObj.RefreshToken;
+
+                        Debug.WriteLine("getTokenWithParams ---> tokenObj " + JsonConvert.SerializeObject(tokenObj));
+
+                    }
+                    else
+                    {
+                        string message = "Il parametro state non è uguale a quello inviato\nProblema di sicurezza.";
+                        string caption = "Informazioni";
+                        MessageBoxButtons buttons = MessageBoxButtons.OK;
+                        MessageBoxIcon icons = MessageBoxIcon.Information;
+
+                        TopMostMessageBox.Show(message, caption, buttons, icons);
+                    }
+                }
+            }
+
+            return accessToken;
+        }
+
+
+        /// <summary>
+        /// Legge l'url dalla Tab di Chrome attiva con la redirect url
+        /// </summary>
+        /// <returns></returns>
+        public string GetActiveTabUrl()
+        {
+            Process[] procsChrome = Process.GetProcessesByName("chrome");
+
+            foreach (Process chrome in procsChrome)
+            {
+                if (chrome.MainWindowHandle == IntPtr.Zero)
+                    continue;
+
+                AutomationElement element = AutomationElement.FromHandle(chrome.MainWindowHandle);
+                if (element == null)
+                    return null;
+
+                Condition conditions = new AndCondition(
+                    new PropertyCondition(AutomationElement.ProcessIdProperty, chrome.Id),
+                    new PropertyCondition(AutomationElement.IsControlElementProperty, true),
+                    new PropertyCondition(AutomationElement.IsContentElementProperty, true),
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit));
+
+                AutomationElement elementx = element.FindFirst(TreeScope.Descendants, conditions);
+
+                return ((ValuePattern)elementx.GetCurrentPattern(ValuePattern.Pattern)).Current.Value as string;
+            }
+
+            return "";
+        }
+
+
+        /// <summary>
+        /// Esegue l'autenticazione e salva il token se questo non esiste
+        /// </summary>
+        /// <returns>accessToken</returns>
+        public string getSaveToken()
+        {
+            string accessToken = String.Empty;
+
+            string message = "Attendi la conclusione di redirect su localhost,\npoi fai click su OK per salvare il token\ne chiudi la tab del redirect su localhost\nse ancora aperta.";
+            string caption = "Informazioni";
+            MessageBoxButtons buttons = MessageBoxButtons.OK;
+            MessageBoxIcon icons = MessageBoxIcon.Information;
+
+            TopMostMessageBox.Show(message, caption, buttons, icons);
+
+            //##########################################
+            accessToken = this.getSaveTokenWithParams();
+            //##########################################
+
+            if (String.IsNullOrEmpty(accessToken))
+            {
+                accessToken = this.readToken();
+            }
+
+            message = "accessToken:\n" + accessToken;
+            //TopMostMessageBox.Show(message, caption, buttons, icons);
+
+
+            if (!chromeprocess.HasExited)
+            {
+                chromeprocess.CloseMainWindow();
+                chromeprocess.Close();
+                chromeprocess = null;
+            }
+
+            return accessToken;
+        }
+
+        /// <summary>
+        /// Esegue la configurazione
+        /// </summary>
+        /// <param name="accessToken"></param>
+        /// <returns>config</returns>
+        public Configuration getConfig(string accessToken)
+        {
+            Configuration config = new Configuration();
+            config.AccessToken = accessToken.Replace(@"\", "");
+            config.BasePath = _basePath;
+
+            return config;
+        }
+
+        //==========================================================================================================
+        //==========================================================================================================
+        //==========================================================================================================
+
+
+        /// <summary>
+        /// Legge il token; se non esiste esegue l'auenticazione e salva il nuovo token; se scaduto esegue il refreh e salva il nuovo token
+        /// </summary>
+        /// <returns>company_id</returns>
+        public int getCompanyID()
+        {
+            int company_id = 0;
+
+            string accessToken = this.readToken();
+
+            if (String.IsNullOrEmpty(accessToken))
+            {
+                accessToken = this.getSaveToken();
+            }
+
+            try
+            {
+                Configuration config = this.getConfig(accessToken);
+                var apiInstance = new ClientsApi(config);
+
+                var userApiInstance = new UserApi(config);
+
+                // Retrieve User Companies
+                var userCompaniesResponse = userApiInstance.ListUserCompanies();
+                var firstCompanyId = userCompaniesResponse.Data.Companies[0].Id;
+
+                company_id = Convert.ToInt32(firstCompanyId);
+
+                //MessageBox.Show("companyId:\n" + company_id.ToString(), "Informazioni", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (ApiException error)
+            {
+                MessageBox.Show("Exception when calling clientApi.CreateClient: " + error.Message, "Informazioni", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                Debug.Print("Exception when calling clientApi.CreateClient: " + error.Message);
+                Debug.Print("Status Code: " + error.ErrorCode);
+                Debug.Print(error.StackTrace);
+            }
+
+            return company_id;
+        }
+        
+        //°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°
+
+        
+    }
+}
